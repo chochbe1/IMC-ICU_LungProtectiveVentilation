@@ -575,7 +575,7 @@ write.csv(tab1_excel, file="tables/table1_wave_overall.csv")
 
 ```
 
-```{r Show LPV Line Chart Plus Admit Count by Study Quarter}
+```{r Code for Figure 1: LPV Line Chart Plus Admit Count by Study Quarter}
 #Generate # of Admissions per Quartery by Unit Type
 df <- df |>
   group_by(study_quarter, imc_icu) |>
@@ -702,7 +702,7 @@ write_dta(covid_imc_icu_nb, '~/workspace/Storage/chochbe1/persistent/IMC-ICU_COV
 ```
 
 
-```{r Kaplan Meier and Cumulative Incidence Curves by IMCU}
+```{r Code for Figure 2: Kaplan Meier and Cumulative Incidence Curves by IMCU}
 print(km90 <- survfit2(Surv(diedtime90, died90) ~ imc_icu, data = analytic_short) %>%
         ggsurvfit(linetype_aes = TRUE,
                   linewidth = 0.60) +
