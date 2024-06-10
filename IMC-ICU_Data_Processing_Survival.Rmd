@@ -1,0 +1,946 @@
+---
+title: "IMC-ICU_Data Processing"
+author: "Chad Hochberg"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+#Order of Final Data Cleaning and Analysis
+#1: Create Needed Variables and Do Initial Data Cleaning
+#2: Include Target ICUs and Calculate TV/PBW in First 48 Hours, and Other Study Outcomes
+#3: Implement Final Inclusion/Exclusion Criteria
+
+
+```{r setup, include=FALSE}
+library(tidyverse) #Allows use of the dplyr vocabulary
+library(lubridate)
+library(data.table) #At times faster than dplyr for large data
+library(tableone) #Nice use of Tables
+library(DescTools) #For Tables
+library(arrow) #Apache package used for efficient storing of large tables as "arrow_tables"
+library(here)  #Useful for saving data/file paths et cetera
+library(broom) #Tidys results of regression analysis
+library(gridExtra)
+library(survival) #For Survival Analysis
+library(ggsurvfit) #For Kaplan-Meier Curves
+library(htestClust) #For Clustered Chi Square Test
+library(haven) #For Writing .dta file
+library(collapse) #Fast Data Processing
+
+#Create a 'Not In' function
+`%!in%` <- Negate(`%in%`)
+
+#Set Working Directory
+setwd("~/workspace/Storage/chochbe1/persistent/IMC-ICU_COVID19")
+knitr::opts_knit$set(root.dir = "~/workspace/Storage/chochbe1/persistent/IMC-ICU_COVID19")
+
+here::i_am('IMC-ICU_COVID19/20240407_IMC-ICU_Analysis.Rmd')
+
+select <- dplyr::select
+```
+
+```{r Open Parquet Files}
+analytic_sample_covid <- read_parquet(
+  '~/workspace/Storage/chochbe1/persistent/IMC-ICU_COVID19/data/analytic_sample_covid')
+analytic_covid_longform <- read_parquet(
+  '~/workspace/Storage/chochbe1/persistent/IMC-ICU_COVID19/data/analytic_covid_longform')
+tv_long <- read_parquet(
+  '~/workspace/Storage/chochbe1/persistent/IMC-ICU_COVID19/data/raw_data/tv_long')
+sofa_covid <- read_parquet('~/workspace/Storage/chochbe1/persistent/IMC-ICU_COVID19/data/raw_data/sofa_covid')
+ards_orderset <- read_csv('~/workspace/Storage/chochbe1/persistent/IMC-ICU_COVID19/data/ards_orderset.csv')
+```
+
+
+```{r Some Initial EDA, Cleaning and Building Variables}
+#Can Build in Needed Variables Here
+analytic_sample_covid <- analytic_sample_covid %>% 
+  mutate(year=year(final_admit_date)) %>% #Admit year
+  mutate(mv_from_diagnosis=(vent_start-initial_dx_date)/ddays(1)) 
+print("Summary of Time from Diagnosis to Vent Start in Days")
+summary(analytic_sample_covid$mv_from_diagnosis)
+
+#Tidy Race and ethnicity Variables
+table(analytic_sample_covid$race, analytic_sample_covid$ethnicity, useNA = "ifany")
+analytic_sample_covid <- analytic_sample_covid %>%
+  mutate(race=fifelse(
+    (race=="Other Asian" | race=="Japanese" | race=="Korean" | race=="Asian Indian" | race=="Filipino"), "Asian", race)
+  ) %>%
+  mutate(race=fifelse(
+    ((ethnicity == "Hispanic" | ethnicity=="Oth Hispanic" | ethnicity=="Mexican" | ethnicity == "Puerto Rican") & (race=="Other" | race=="Unknown")), "Hispanic", race)) %>%
+  #Combine Other and Not Disclose
+  mutate(race=fifelse(
+    race=="NotDisclose", "Other", race)) %>%
+  mutate(race=fifelse(is.na(race), "Hispanic", race)) %>% #1 Missing Value for Race Listed 'Hispanic' as ethnicity
+  mutate(race=fifelse(ethnicity %in% c("Oth Hispanic"), "Hispanic", race)) %>%
+  mutate(ethnicity=fifelse(
+    (ethnicity %in% c("Hispanic", "Mexican", "Oth Hispanic", "Puerto Rican")), "Hispanic", "Not Hispanic"))
+#Check this was Done Correctly
+table(analytic_sample_covid$race, analytic_sample_covid$ethnicity, useNA = "ifany")
+
+#Generate Academic Hospital
+analytic_sample_covid <- analytic_sample_covid %>%
+#Generate Admit to to MV variable (in hours)
+  mutate(admit_to_mv=((as.duration(vent_start-final_admit_date))/dhours(1))) %>%
+#Generate prone_gt24h variable
+  mutate(prone_gt24h=fifelse(
+    first_prone_duration>=24, 1, 0)) %>%
+  mutate(prone_gt24h=factor(prone_gt24h, levels = c(0,1), labels = c("Standard Proning", "Extended Proning"))) %>%
+#Generate Age_gt80 and Nonwhite
+  mutate(age_gt80=fifelse(age>=80, 1, 0)) %>%
+  mutate(nonwhite=fifelse(race=="White", 0, 1)) %>%
+#Generate BMI Categories
+  mutate(bmi_cat=case_when(
+    bmi<30 ~ 0,
+    bmi>=30 & bmi<50 ~ 1,
+    bmi>=50 ~ 2
+  )) %>% 
+  mutate(bmi_cat = factor(bmi_cat, levels = c(0:2), labels = c("Not Obese", "Obese", "Extreme Obesity"))) %>%
+#Generate Study Month
+   mutate(study_month=case_when(
+    year=="2020" ~ month(final_admit_date)-2,
+    year=="2021" ~ month(final_admit_date) + 10)) %>%
+  mutate(year_month=month(final_admit_date)) %>%
+  relocate(study_month:year_month, .after = year) 
+
+#Now Create Study Periods
+analytic_sample_covid <- analytic_sample_covid |>
+  mutate(covid_period=fcase(
+    study_month<=7, 0,
+    study_month>7, 1
+  )) |>
+  mutate(covid_period=factor(covid_period, labels = c('wave1', 'wave2'), ordered = TRUE))
+
+#Create Study Quarter
+analytic_sample_covid <- analytic_sample_covid |>
+  mutate(study_quarter=fcase(
+    study_month==1, 1,
+    study_month>1 & study_month<=4, 2, 
+    study_month>4 & study_month<=7, 3,
+    study_month>7 & study_month<=10, 4,
+    study_month>10 & study_month<=13, 5,
+    study_month>13, 6
+  )) |>
+  mutate(study_quarter=factor(study_quarter, 
+        labels = c('2020:Mar', '2020:Apr-Jun', '2020:Jul-Sep', '2020:Oct-Dec', '2021:Jan-Mar', '2021:Apr-May'),
+        ordered = TRUE))
+
+#Create Proning Variables
+analytic_sample_covid <- analytic_sample_covid %>%
+  mutate(proned=fifelse(prone_episodes==0, 0, 1)) %>%
+  mutate(time_to_prone=as.duration(first_pronetime-vent_start)/dhours(1)) %>%
+  mutate(proned48=fifelse(time_to_prone<=48, 1, 0)) %>%
+  mutate(proned48=fifelse(is.na(time_to_prone), 0, proned48)) %>%
+  mutate(proned72=fifelse((proned==1 & time_to_prone<=72), 1, 0)) %>%
+  mutate(proned72=fifelse(is.na(time_to_prone), 0, proned72))
+
+#Define ECMO Receipt
+analytic_sample_covid <- analytic_sample_covid %>%
+  mutate(ecmo=fifelse(!is.na(ecmo_start),1,0)) %>%
+  mutate(vent_to_ecmo=(ecmo_start-vent_start)/ddays(1))
+print('Time from First Proning to ECMO (Days)')
+summary(analytic_sample_covid$vent_to_ecmo)
+
+#Define Lowest PF Ratio (or Imputed) in 1st 24 Hours and Associated Values
+analytic_sample_covid <- analytic_sample_covid |>
+  mutate(pf_ratio_qualifying=fcase(
+    !is.na(low_pf_24), low_pf_24,
+    is.na(low_pf_24), pf_ratio_imputed_sflow
+  )) |>
+  mutate(fio2_qualifying=fcase(
+    !is.na(low_pf_24), fio2_lowpf,
+    is.na(low_pf_24), fio2_lowsf
+  )) |>
+  mutate(peep_qualifying=fcase(
+    !is.na(low_pf_24), peep_lowpf,
+    is.na(low_pf_24), peep_lowsf
+  ))
+
+#Define IMCCU
+analytic_sample_covid <- analytic_sample_covid |>
+  mutate(imc_icu=fifelse(
+    target_icu == 'IMC/ICU', 1, 0
+  )) |>
+  mutate(imc_icu=factor(imc_icu, levels = c(0,1), labels = c('ICU', 'IMCU'), ordered = TRUE))
+ 
+#Stratify Period by Unit
+analytic_sample_covid <- analytic_sample_covid |>
+  mutate(covid_period_unit=fcase(
+    covid_period=='wave1' & imc_icu=='ICU', 0,
+    covid_period=='wave1' & imc_icu=='IMCU', 1,
+    covid_period=='wave2' & imc_icu=='ICU', 2,
+    covid_period=='wave2' & imc_icu=='IMCU', 3
+  )) |>
+  mutate(covid_period_unit=factor(covid_period_unit, 
+                                  labels = c('ICU:wave1', 'IMC:wave1', 'ICU:wave2', 'IMC:wave2'),  ordered=TRUE))
+
+#Merge in Data on ARDS Orderset; Note this is generated from a presence of an order, so if data are missing, can be considered '0' (ONLY AT JHH AND BMC)
+analytic_sample_covid <- analytic_sample_covid |>
+  join(ards_orderset, how = 'left') |>
+  mutate(ards_orderset_48=fifelse(
+    is.na(ards_orderset_48) & (hospital=='JHH' | hospital=='BMC'), 0, ards_orderset_48))
+ 
+```
+
+#Create Adherence Measures: 
+1) Primary will be % of first 48 hours in which TV/PBW <= 6.5 with Pplat <=30
+   1a) Secondary: % of First 48 Hours in Which TV/PBW <=6.5 with Pplat <=30 OR if Pplat >30 TV has to be less than 6
+2) Will need to calculate time-weighted DP, TV/PBW, PEEP to do this
+3) Exclude time on spontaneous modes of MV
+
+```{r Define Study Outcome Variables on Sample Treated in Study ICU}
+#Start Out by Only Creating Outcome Variables for Patients in Target ICUs
+#Extract the Variables That Will be Needed from analytic short
+analytic_short <- analytic_sample_covid |>
+  filter(!is.na(target_icu))
+df_long <- analytic_covid_longform |>
+  filter(osler_id %in% analytic_short$osler_id)
+
+temp <- analytic_short |>
+  select(osler_id, predicted_bw, vent_start, target_icu_in_dttm, ecmo_start)
+print('Are Any Predicted Body Weights Missing?')
+print(sum(is.na(analytic_short$predicted_bw)))
+
+#Extract Needed Variables
+df_long <- df_long |>
+  left_join(temp) |>
+  select(osler_id, recorded_time, fio2_extrapolated_long, peep_long, peep_extrapolated_long:first_pronetime, final_tv, tv_mode, ecmo_on, o2_status:target_icu_in_dttm, ecmo_start) |>
+  relocate(final_tv, tv_mode, .after=fio2_extrapolated_long) 
+
+#Filter to Values (TV, Pplat, Phigh) Within 48 Hours of Target ICU, Exclude ECMO, Exclude Time not on Mechanical Ventilation
+df_long <- df_long |>
+  #Create a Variable Indicating Time from Ventilation or Target ICU if vent start is before target icu than will use time from target ICU to observation
+  mutate(time_from_vent=fcase(
+    vent_start>=target_icu_in_dttm, as.duration(recorded_time-vent_start)/dhours(1),
+    vent_start<target_icu_in_dttm, as.duration(recorded_time-target_icu_in_dttm)/dhours(1)
+  )) |>
+  filter(time_from_vent >= 0 & time_from_vent <= 48) |>
+  mutate(keep=fifelse(
+   !is.na(final_tv) | !is.na(pplat_long) | !is.na(phigh_long), 1, 0)) |>
+  filter(keep==1) |> select(-keep) |>
+  group_by(osler_id) |>
+  fill(o2_status, ecmo_on, .direction = 'downup') |> ungroup()|>
+  filter(o2_status==5) |>
+  #Exclude Values Taken While on ECMO
+  filter(ecmo_on!=1)
+
+#Will Carry Forward Tidal Volumes that Are Not Recorded When a New Pplat or Phigh is Recorded Without Accompanying Tidal Volume
+df_long <- df_long %>%
+  mutate(tv_long=final_tv) |>
+  group_by(osler_id) |> arrange(osler_id, recorded_time) |>
+  fill(tv_long, .direction ='down') |>
+  fill(tv_mode, .direction = 'down') |>
+  mutate(tvpbw_long=round(tv_long/predicted_bw, digits = 1)) |>
+  relocate(tv_long, tvpbw_long, .after = final_tv)  |>
+  ungroup() |>
+  distinct()
+
+#Create a Variable Tracking the Number of Documented Tidal Volumes, Pplats/Phighs Documented per Patient
+df_long <- df_long |>
+  group_by(osler_id) |>
+  mutate(tv_nums = sum(!is.na(final_tv)),
+    pplat_nums = sum(!is.na(pplat_long)) + sum(!is.na(phigh_long))) |>
+  ungroup()
+print('Summary of the Number of TVs Documented in First 48 Hours')
+summary(df_long$tv_nums)
+print('Summary of the Number of Pplats Documented in First 48 Hours')
+summary(df_long$pplat_nums)
+
+#What Vent Modes are In These Data
+print('Vent Modes in First 48 Hours')
+PercTable(table(df_long$tv_mode), margins = c(2))
+
+#Calculate Time Weighted Tidal Volume and % of Documentations Meeting TV/PBW <= 6.5 with Pplat < 30
+#Mark Eligible Tidal Volume - One that is on Controlled Mode of Ventilation
+mode <- c('PC', 'PRVC', 'SIMV PRVC', 'SIMV Vol', 'VC', 'Volume Guarantee')
+df_long <- df_long |>
+  mutate(tv_eligible=fifelse(
+    tv_mode %in% mode, 1, 0)) |>
+  mutate(lpv_met=fcase(
+    tvpbw_long<=6.5 & pplat_long<=30, 1,
+    tvpbw_long>6.5, 0,
+    pplat_long>30, 0,
+    is.na(pplat_long), NaN
+  )) |>
+  mutate(lpv_met_expanded=fcase(
+    tvpbw_long<=6.5 & pplat_long<=30, 1,
+    tvpbw_long>6.5, 0,
+    pplat_long>30 & tvpbw_long<6.0, 1,
+    pplat_long>30 & tvpbw_long>=6.0, 0,
+    is.na(pplat_long), NaN
+  )) |>
+  mutate(tv_lt8=fifelse(tvpbw_long<=8, 1, 0)) |>
+  mutate(tv_gt8=fifelse(tv_lt8==0, 1, 0)) |>
+  mutate(tv_lt6.5=fifelse(tvpbw_long<=6.5, 1, 0))
+
+tvpbw <- df_long |>
+  #Calculate Time at TV (this is time from one TV documentation to next. If LAST documentation it is the difference between 48 hours and the time after vent of that documentation)
+  filter(!is.na(tv_long)) |>  
+  group_by(osler_id) |>
+  mutate(last=fifelse(row_number()==n(), 1, 0)) |>
+  mutate(time_at_tv=fcase(
+    last==1, 48-time_from_vent,
+    last==0, as.duration(lead(recorded_time) - recorded_time)/dhours(1)
+  )) |> ungroup()
+print('Summary of the Time Spent at Each TV Documentation (hours)')
+summary(tvpbw$time_at_tv)
+
+#Now Calculate Time Weighted TV, 1st for "eligible TVs", and calculate a simple mean, and then repeat including TVs from all modes
+tvpbw <- tvpbw |>
+  group_by(osler_id, tv_eligible) |> #Grouped so it Excludes (or calculates separately non-eligible TVs)
+  mutate(total_time=sum(time_at_tv)) |>
+  mutate(temp=sum(tvpbw_long*time_at_tv)) |>
+  mutate(tvpbw_weighted=temp/total_time) |>
+  mutate(tvpbw_weighted=fifelse(tv_eligible==1, tvpbw_weighted, NaN)) |>
+  mutate(tvpbw_mean=mean(tvpbw_long)) |>
+  mutate(tvpbw_mean=fifelse(tv_eligible==1, tvpbw_mean, NaN)) |>
+  #Now Repeat to Calculate Time at TV < 8 and Time to TV < 6.5
+  mutate(temp=tv_lt8*time_at_tv) |>
+  mutate(temp=sum(temp)) |>
+  mutate(tv_lt8_percent=round(temp/total_time, digits = 2)) |>
+  mutate(tv_lt8_percent=fifelse(tv_eligible==1, tv_lt8_percent, NaN)) |>
+  mutate(temp=tv_lt6.5*time_at_tv) |>
+  mutate(temp=sum(temp)) |>
+  mutate(tv_lt6.5_percent=round(temp/total_time, digits = 2)) |>
+  mutate(tv_lt6.5_percent=fifelse(tv_eligible==1, tv_lt6.5_percent, NaN)) |>
+  #Calculate Hours with TV>8
+  mutate(temp=tv_gt8*time_at_tv) |>
+  mutate(tv_gt8_hours=sum(temp)) |>
+  mutate(tv_gt8_hours=fifelse(tv_eligible==1, tv_gt8_hours, NaN)) |>
+  ungroup() |>
+  #Now Fill in the tvpbw_weighted, and then calculate once including all modes
+  group_by(osler_id) |>
+  fill(tvpbw_weighted, tvpbw_mean, tv_lt8_percent, tv_lt6.5_percent, tv_gt8_hours, .direction = 'updown') |>
+  #Now recalculate for all observations
+  mutate(total_time=sum(time_at_tv)) |>
+  mutate(temp=sum(tvpbw_long*time_at_tv)) |>
+  mutate(tvpbw_weighted_allmode=temp/total_time) |>
+  mutate(tvpbw_mean_allmodes=mean(tvpbw_long)) |>
+  ungroup()
+
+#Implement Criteria of LPV as < 6.5 and Pplat <=30 (consistent with SAGE), Time Weighted Percentage Meeting Criteria
+lpv_long <- df_long |>
+  filter(!is.na(lpv_met)) |>  
+  group_by(osler_id) |>
+  mutate(last=fifelse(row_number()==n(), 1, 0)) |>
+  mutate(time_at_lpv=fcase(
+    last==1, 48-time_from_vent,
+    last==0, as.duration(lead(recorded_time) - recorded_time)/dhours(1)
+  )) |> 
+  ungroup() |>
+  filter(tv_eligible==1) |> #Only Eligible Vent Modes Included here (no APRV or spontaneous modes)
+  group_by(osler_id) |> 
+  #Keep Track of LPV Numerator (Number Met) and Denominator (Number Documented)
+  mutate(lpv_denominator=n()) |>
+  mutate(lpv_numerator=sum(lpv_met)) |>
+  mutate(total_lpv_time=sum(time_at_lpv)) |>
+  mutate(lpv_hours=sum(lpv_met*time_at_lpv)) |>
+  mutate(lpv_percent=round(lpv_hours/total_lpv_time, digits = 2)) |>
+  mutate(lpv_mean=round(mean(lpv_met), digits = 2)) |>
+  #Repeat for LPV Expanded
+  #Keep Track of LPV Numerator (Number Met) and Denominator (Number Documented)
+  mutate(lpv_denominator_ex=n()) |>
+  mutate(lpv_numerator_ex=sum(lpv_met_expanded)) |> #LPV met and Expanded Share Same Total Time
+  mutate(lpv_hours_ex=sum(lpv_met_expanded*time_at_lpv)) |>
+  mutate(lpv_percent_expanded=round(lpv_hours_ex/total_lpv_time, digits = 2)) |>
+  mutate(lpv_mean_expanded=round(mean(lpv_met_expanded), digits = 2)) |>
+  #Include Baseline Compliance, 1st STatic Compliance Available
+  #First Need to Fill in Missing
+  mutate(temp=static_compliance_long) |>
+  fill(temp, .direction = 'updown') |>
+  mutate(compliance_baseline=first(temp)) |> select(-temp) |>
+  ungroup() |>
+  select(osler_id, lpv_denominator:compliance_baseline, recorded_time, total_lpv_time, lpv_hours)
+  
+#Create Summary Table at Patient Level
+tv_sum <- tvpbw |>
+  group_by(osler_id) |>
+  filter(row_number()==1) |> ungroup() |>
+  select(osler_id, tv_nums, pplat_nums, tvpbw_weighted:tvpbw_mean_allmodes)
+#Add in LPV Metrics
+temp <- lpv_long |>
+  group_by(osler_id) |>
+  filter(row_number()==1) |>
+  select(-recorded_time)
+tv_sum <- tv_sum |> left_join(temp)
+rm(temp)
+
+#Summarise t=These
+print('Summary of Weighted TVs')
+summary(tv_sum$tvpbw_weighted)
+print('Summary of Mean TVs')
+summary(tv_sum$tvpbw_mean)
+print('% Time with TV Less Than 8')
+summary(tv_sum$tv_lt8_percent)
+print('Summary of Weighted TVs (All Modes)')
+summary(tv_sum$tvpbw_weighted_allmode)
+print('Summary of Mean TVs (All Modes)')
+summary(tv_sum$tvpbw_mean_allmodes)
+print('NOTE: All 5 with Missing Weighted TV-PBW, Only had Spontaneous or APRV modes Documented')
+summary(tv_sum$tvpbw_mean_allmodes)
+print('NOTE: All 5 with Missing Weighted TV-PBW, Only had Spontaneous or APRV modes Documented')
+print('Time-weighted % of Documentations Meeting LPV')
+summary(tv_sum$lpv_percent)
+print('% of Documentation Meeting LPV (NOT TIME WEIGHTED')
+summary(tv_sum$lpv_percent)
+
+#Time-weighted Driving Pressure
+dp_long <- df_long |>
+  #Calculate Time at DP (this is time from one TV documentation to next. If LAST documentation it is the difference between 48 hours and the time after vent of that documentation)
+  filter(!is.na(driving_p_long)) |>  
+  group_by(osler_id) |>
+  mutate(last=fifelse(row_number()==n(), 1, 0)) |>
+  mutate(time_at_dp=fcase(
+    last==1, 48-time_from_vent,
+    last==0, as.duration(lead(recorded_time) - recorded_time)/dhours(1)
+  )) |> ungroup() |>
+  #Grouped so it Excludes (or calculates separately non-eligible modes)
+  group_by(osler_id, tv_eligible) |> 
+  mutate(total_time=sum(time_at_dp)) |>
+  mutate(temp=sum(driving_p_long*time_at_dp)) |>
+  mutate(driving_p_weighted=round(temp/total_time, digits=1)) |>
+  mutate(driving_p_weighted=fifelse(tv_eligible==1, driving_p_weighted, NaN)) |>
+  ungroup() |>
+  #Now Fill in the tvpbw_weighted, and then calculate once including all modes
+  group_by(osler_id) |>
+  fill(driving_p_weighted, .direction = 'updown') |>
+  ungroup()
+
+#Time-weighted PPlat
+pplat_long <- df_long |>
+  #Calculate Time at DP (this is time from one TV documentation to next. If LAST documentation it is the difference between 48 hours and the time after vent of that documentation)
+  filter(!is.na(pplat_long)) |>  
+  group_by(osler_id) |>
+  mutate(last=fifelse(row_number()==n(), 1, 0)) |>
+  mutate(time_at_dp=fcase(
+    last==1, 48-time_from_vent,
+    last==0, as.duration(lead(recorded_time) - recorded_time)/dhours(1)
+  )) |> ungroup() |>
+  #Grouped so it Excludes (or calculates separately non-eligible modes)
+  group_by(osler_id, tv_eligible) |> 
+  mutate(total_time=sum(time_at_dp)) |>
+  mutate(temp=sum(pplat_long*time_at_dp)) |>
+  mutate(pplat_weighted=round(temp/total_time, digits=1)) |>
+  mutate(pplat_weighted=fifelse(tv_eligible==1, pplat_weighted, NaN)) |>
+  #Calculate Time-weighted % of Time with Pplat > 30
+  mutate(pplat_lt30=fifelse(
+    pplat_long<=30, 1, 0
+  )) |>
+  mutate(temp=sum(pplat_lt30*time_at_dp)) |>
+  mutate(pplat_lt30_weighted=round(temp/total_time, digits=1)) |>
+  mutate(pplat_lt30_weighted=fifelse(tv_eligible==1, pplat_lt30_weighted, NaN)) |>
+  ungroup() |>
+  #Now Fill in the tvpbw_weighted, and then calculate once including all modes
+  group_by(osler_id) |>
+  fill(pplat_weighted, pplat_lt30_weighted, .direction = 'updown') |>
+  ungroup() 
+
+#Now Merge All Together in a 'Vent_Sum' Flowsheet, Can Bring into Analytic Dataset Later On
+temp <- dp_long |>
+  group_by(osler_id) |>
+  filter(row_number()==1) |>
+  select(osler_id, driving_p_weighted)
+temp2 <- pplat_long |>
+  group_by(osler_id) |>
+  filter(row_number()==1) |>
+  select(osler_id, pplat_weighted, pplat_lt30_weighted)
+#Now Merge Together
+vent_sum <- tv_sum |>
+  left_join(temp) |>
+  left_join(temp2)
+
+#Remove Unneeded Flowsheets, Leave 'Long' Flowsheets
+rm(temp, temp2, tv_sum)
+
+#Create a Vent Long Flowsheet That Will be Used to Create Analytic_vent_long
+vent_long <- df_long
+
+```
+
+
+```{r Table 1 Data and Explore Missingness}
+#Merge in Baseline Compliance Variable
+compliance <- analytic_vent |>
+  select(osler_id, compliance_baseline) 
+analytic_short <- analytic_short |>
+  left_join(compliance)
+df <- analytic_short
+rm(compliance)
+to_tab <- c(
+            "age",
+            "age_gt80",
+            "gender",
+            "race",
+            "nonwhite",
+            "study_month",
+            "study_quarter",
+            "target_icu",
+            "bmi",
+            "charlson",
+            "admit_to_mv",
+            "nr_sofa_score",
+            "vasopressor_use",
+            "pf_ratio_qualifying",
+            "low_pf_24",
+            "low_sf_24",
+            "fio2_qualifying",
+            "paco2_lowpf",
+            "peep_qualifying",
+            "compliance_baseline",
+            "steroids",
+            "immunomodulator",
+            "immuno_name",
+            "remdesivir",
+            "study_drug",
+            "ards_orderset_48"
+)
+
+factors_tab <- c(
+            "age_gt80",
+            "gender",
+            "race",
+            "nonwhite",
+            "study_quarter",
+            "target_icu",
+            "vasopressor_use",
+            "steroids",
+            "immunomodulator",
+            "immuno_name",
+            "remdesivir",
+            "study_drug",
+            "ards_orderset_48"
+)
+nonnorm_tab <- c("age",
+            "bmi",
+            "charlson",
+            "admit_to_mv",
+            "study_month",
+            "nr_sofa_score",
+            "pf_ratio_qualifying",
+            "low_pf_24",
+            "low_sf_24",
+            "fio2_qualifying",
+            "paco2_lowpf",
+            "peep_qualifying",
+            "compliance_baseline")
+        
+#First Create Table with Numbers of Missing and Min/Max
+tab1 <- CreateTableOne(vars = to_tab, data=df, factorVars = factors_tab)
+summary(tab1)
+#Now Create a Traditional Table 1, Using Non-parametric Testing
+tab1 <- CreateTableOne(vars = to_tab, strata="imc_icu", data=df, factorVars = factors_tab, addOverall = TRUE)
+print(tab1, nonnormal=nonnorm_tab)
+tab1_excel <- print(tab1, nonnorm=nonnorm_tab, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_by_imc_icu.csv")
+rm(tab1_excel)
+
+#Now Create Stratified by ICU
+tab1 <- CreateTableOne(vars = to_tab, strata="target_icu", data=df, factorVars = factors_tab, addOverall = FALSE)
+print(tab1, nonnormal=nonnorm_tab)
+tab1_excel <- print(tab1, nonnorm=nonnorm_tab, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_by_icu.csv")
+rm(tab1_excel, tab1)
+
+#Print First and Last Dates of Admits
+print('First and Last Dates of Admits')
+a <- analytic_short %>% arrange(final_admit_date)
+head(a$final_admit_date, 1)
+tail(a$final_admit_date, 1)
+
+print('Firt and Last Dates of Admits [IMC]')
+head(a$final_admit_date[a$imc_icu=='IMCU'], 1)
+tail(a$final_admit_date[a$imc_icu=='IMCU'], 1)
+
+print('Firt and Last Dates of Admits [ICUs]')
+head(a$final_admit_date[a$imc_icu=='ICU'], 1)
+tail(a$final_admit_date[a$imc_icu=='ICU'], 1)
+rm(a)
+
+#Table Stratified by Unit and Quarter
+tab1 <- CreateTableOne(vars = to_tab, strata="quarter_unit", data=analytic_short, factorVars = factors_tab, addOverall = FALSE)
+print(tab1, nonnormal=nonnorm_tab)
+tab1_excel <- print(tab1, nonnorm=nonnorm_tab, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_quarter_unit.csv")
+
+#Table Stratified by Unit and COVID Period
+tab1 <- CreateTableOne(vars = to_tab, strata="covid_period_unit", data=analytic_short, factorVars = factors_tab, addOverall = FALSE)
+print(tab1, nonnormal=nonnorm_tab)
+tab1_excel <- print(tab1, nonnorm=nonnorm_tab, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_wave_unit.csv")
+
+#Table 1 Stratified by WAVE ONLY
+tab1 <- CreateTableOne(vars = to_tab, strata="covid_period", data=analytic_short, factorVars = factors_tab, addOverall = FALSE)
+print(tab1, nonnormal=nonnorm_tab)
+tab1_excel <- print(tab1, nonnorm=nonnorm_tab, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_wave_overall.csv")
+
+```
+
+```{r Show LPV Line Chart Plus Admit Count by Study Quarter}
+#Generate # of Admissions per Quartery by Unit Type
+df <- df |>
+  group_by(study_quarter, imc_icu) |>
+  mutate(q_count=n()) |>
+  mutate(qadmits=q_count/200) |> #Scale # of Admits on percentage plot and divide by 2
+  mutate(qlpv=median(lpv_percent, na.rm = TRUE)) |>
+  mutate(qlpv_ex=median(lpv_percent_expanded, na.rm = TRUE)) |>
+  ungroup() |>
+  #Now do For Individual ICUs
+  group_by(study_quarter, target_icu) |>
+  mutate(month_count_icu=n()) |>
+  mutate(admits_icu=month_count_icu/200) |> #This is for Creating a Two Axis Graph With Admits per Month on Smaller Y axis
+  mutate(icu_lpv=median(lpv_percent, na.rm = TRUE)) |>
+  mutate(icu_lpv_ex=median(lpv_percent_expanded, na.rm = TRUE)) |>
+  ungroup()
+
+#LPV Percent
+ggplot(df, aes(x=study_quarter, y=qlpv, group = imc_icu)) +
+  geom_line(aes(colour = imc_icu, linetype = imc_icu), size = 1.25) +
+  geom_point(aes(color = imc_icu)) +
+  scale_y_continuous(breaks=seq(0,1, by=0.1), labels = scales::percent, limits = c(0,1),
+                     name = 'Median % Time at LPV', 
+                     sec.axis = sec_axis(trans = ~.*100, name = '                                             
+                                        Admission Count',
+                                         breaks=c(0,5,10,15,20,25,30,35,40),
+                                         labels = c('0', '10', '20', '30', '40', '50', '60', '70', '80'))) +
+  scale_x_discrete(labels = c('2020\nMar', '2020\nApr-Jun', '2020\nJul-Sep', 
+                              '2020\nOct-Dec', '2021\nJan-Mar', '2021\nApr-May'),
+                   name = 'Study Quarter') +
+  scale_color_manual(values = c('#54738E', '#82AC7C')) +
+  scale_fill_manual(values = c('#54738E', '#82AC7C')) +
+  geom_bar(aes(x=study_quarter, y=qadmits, fill = imc_icu),
+           stat = 'identity', position = 'dodge', show.legend = FALSE) +
+  theme_classic()
+ggsave('lpv_percent_study_quarter.pdf',
+       path='graphs/')
+
+
+#LPV Percent Expanded
+ggplot(df, aes(x=study_quarter, y=qlpv_ex, group = imc_icu)) +
+  geom_line(aes(colour = imc_icu, linetype = imc_icu), size = 1.25) +
+  geom_point(aes(color = imc_icu)) +
+  scale_y_continuous(breaks=seq(0,1, by=0.1), labels = scales::percent, limits = c(0,1),
+                     name = 'Median % Time at LPV [Expanded Definition]', 
+                     sec.axis = sec_axis(trans = ~.*100, name = '                                                      Admission Count',
+                                         breaks=c(0,5,10,15,20,25,30,35,40),
+                                         labels = c('0', '10', '20', '30', '40', '50', '60', '70', '80'))) +
+  scale_x_discrete(labels = c('2020\nMar', '2020\nApr-Jun', '2020\nJul-Sep', 
+                              '2020\nOct-Dec', '2021\nJan-Mar', '2021\nApr-May'),
+                   name = 'Study Quarter') +
+  scale_color_manual(values = c('#54738E', '#82AC7C')) +
+  scale_fill_manual(values = c('#54738E', '#82AC7C')) +
+  geom_bar(aes(x=study_quarter, y=qadmits, fill = imc_icu),
+           stat = 'identity', position = 'dodge', show.legend = FALSE) +
+  theme_classic()
+ggsave('lpv_percent_ex_study_quarter.pdf',
+       path='graphs/')
+
+#Now Show Results Stratified by Individual ICUs
+ggplot(df, aes(x=study_quarter, y=icu_lpv, group = target_icu)) +
+  geom_line(aes(colour = target_icu, linetype = target_icu), size = 1.25) +
+  geom_point(aes(color = target_icu)) +
+  scale_y_continuous(breaks=seq(0,1, by=0.1), labels = scales::percent, limits = c(0,1),
+                     name = 'Median % Time at LPV', 
+                     sec.axis = sec_axis(trans = ~.*100, name = '                                                      Admission Count',
+                                         breaks=c(0,5,10,15,20,25,30,35,40),
+                                         labels = c('0', '10', '20', '30', '40', '50', '60', '70', '80'))) +
+  scale_x_discrete(labels = c('2020\nMar', '2020\nApr-Jun', '2020\nJul-Sep', 
+                              '2020\nOct-Dec', '2021\nJan-Mar', '2021\nApr-May'),
+                   name = 'Study Quarter') +
+  scale_color_manual(values = c('#54738E', '#82AC7C', 'maroon')) +
+  scale_fill_manual(values = c('#54738E', '#82AC7C', 'maroon')) +
+  geom_bar(aes(x=study_quarter, y=admits_icu, fill = target_icu),
+           stat = 'identity', position = 'dodge', show.legend = FALSE) +
+  theme_classic()
+ggsave('lpv_percent_study_quarter_linechart_icus.pdf',
+       path='graphs/')
+
+ggplot(df, aes(x=study_quarter, y=icu_lpv_ex, group = target_icu)) +
+  geom_line(aes(colour = target_icu, linetype = target_icu), size = 1.25) +
+  geom_point(aes(color = target_icu)) +
+  scale_y_continuous(breaks=seq(0,1, by=0.1), labels = scales::percent, limits = c(0,1),
+                     name = 'Median % Time at LPV [Expanded Definition]', 
+                     sec.axis = sec_axis(trans = ~.*100, name = '                                                      Admission Count',
+                                         breaks=c(0,5,10,15,20,25,30,35,40),
+                                         labels = c('0', '10', '20', '30', '40', '50', '60', '70', '80'))) +
+  scale_x_discrete(labels = c('2020\nMar', '2020\nApr-Jun', '2020\nJul-Sep', 
+                              '2020\nOct-Dec', '2021\nJan-Mar', '2021\nApr-May'),
+                   name = 'Study Quarter') +
+  scale_color_manual(values = c('#54738E', '#82AC7C', 'maroon')) +
+  scale_fill_manual(values = c('#54738E', '#82AC7C', 'maroon')) +
+  geom_bar(aes(x=study_quarter, y=admits_icu, fill = target_icu),
+           stat = 'identity', position = 'dodge', show.legend = FALSE) +
+  theme_classic()
+ggsave('lpv_percent_ex_study_quarter_linechart_icus.pdf',
+       path='graphs/')
+
+```
+
+
+```{r Evaluate LPV Measures in Negative Binomial Distribution}
+#Will run Negative Binomial Regressions in Stata
+#Will Model Hours Spent Meeting LPV as Count Data
+df <- df |>
+  #Round to Hours Spent at LPV in Whole Digits
+  mutate(lpv_nb=round(lpv_hours, digits = 0))
+
+#Examine Distributions
+ggplot(data = df, aes(x=lpv_nb)) +
+  geom_histogram(binwidth=1, col = 'black') +
+  scale_x_continuous(breaks=seq(0,48, by = 4))+
+  xlab('Hours in Which LPV Achieved') 
+
+#Repeat for LPV Hours Using the Expanded LPV Definition
+df <- df |>
+  #Round to Hours Spent at LPV in Whole Digits
+  mutate(lpv_nb_expanded=round(lpv_hours_ex, digits = 0))
+
+#Export .dta dataset for Stata analysis
+covid_imc_icu_nb <- df |>
+  select(osler_id, imc_icu, age, gender, nonwhite, bmi, charlson, study_month, height_cm, weight_kg,
+         steroids, immunomodulator, nr_sofa_score, pf_ratio_qualifying, nmb_use, admit_to_mv, compliance_baseline, lpv_nb, lpv_nb_expanded, total_lpv_time, proned48, study_quarter, quarter_unit)
+write_dta(covid_imc_icu_nb, '~/workspace/Storage/chochbe1/persistent/IMC-ICU_COVID19/data/covid_imc_icu_nb.dta')
+```
+
+
+```{r Kaplan Meier and Cumulative Incidence Curves by IMCU}
+print(km90 <- survfit2(Surv(diedtime90, died90) ~ imc_icu, data = analytic_short) %>%
+        ggsurvfit(linetype_aes = TRUE,
+                  linewidth = 0.60) +
+        labs(
+          x = "Days",
+          y = "Survival"
+        ) + 
+        scale_y_continuous(
+          limits = c(0, 1),
+          labels = scales::percent, 
+          expand = c(0.01, 0)
+        ) +
+        scale_color_manual(values = c('#54738E', '#82AC7C')) +
+        scale_fill_manual(values = c('#54738E', '#82AC7C')) +
+        add_confidence_interval() +
+        add_pvalue(caption = "{p.value}", location = c('annotation'), x = 75, y=0.125, size=3) +
+        scale_x_continuous(breaks = seq(0, 90, by = 15), expand = c(0.02, 0)) +
+        theme_classic())
+ggsave("KM_D90.pdf",
+       device = "pdf",
+       path='graphs/')
+
+#Alive and Off Vent Cumulative Incidence Un Weighted Curve
+fg_plotdf <-finegray(Surv(risk_time28, cmprsk_event28) ~ ., 
+                                  data = df,  # Corrected to use tempdf
+                                  etype = 'Off Vent')
+
+fg_survfit2 <-survfit(Surv(fgstart, fgstop, fgstatus) ~ 
+                    imc_icu,
+                    data = fg_plotdf,  # Corrected to use fg_df
+                    weight = fgwt)
+print(offvent28 <- ggsurvfit(
+  fg_survfit2,
+  linetype_aes = TRUE, 
+  type = 'risk') +
+    labs(
+      x = "Days",
+      y = "Off of Ventilator"
+    ) + 
+    scale_y_continuous(
+      limits = c(0, 1),
+      labels = scales::percent, 
+      expand = c(0.01, 0)
+    ) +
+    scale_x_continuous(breaks = seq(0, 28, by = 4), expand = c(0.02, 0)) +
+    scale_color_manual(values = c('#54738E', '#82AC7C')) +
+    scale_fill_manual(values = c('#54738E', '#82AC7C')) +
+    #Have to Add P-Vale manually
+    annotate('text', label = 'p = 0.32', x = 25, y =0.125, size = 3) +
+    add_confidence_interval() +
+    theme_classic())
+ggsave("OffVent_D28.pdf",
+       device = "pdf",
+       path='graphs/')
+
+```
+
+
+```{r Covariate/Outcome Associations}
+#Explore Association Between Continuous Predictors and % of Time Meeting LPV
+fn.histo_associate <- function(df, var) {
+  ggplot(df, 
+       aes(x = var, y = lpv_percent)) +
+  geom_jitter(height = 0.1, width = 2, alpha = 0.25, size = 0.5) +
+  geom_smooth(method = "gam", method.args = list(family = "gaussian")) +
+  scale_y_continuous(breaks=seq(0,1, by=0.25), labels = scales::percent) +
+  labs(x = name, y = "% of Time Meeting LPV", size = 0.1) +
+  theme(axis.title.x = element_text(size = 7),
+    axis.title.y = element_text(size = 7)
+  )
+}
+name <- "Age"
+p1 <- fn.histo_associate(df, df$age)
+name <- "BMI"
+p2 <- fn.histo_associate(df, df$bmi)
+name <- "Charlson Score"
+p3 <- fn.histo_associate(df, df$charlson)
+name <- "PF Qualifying"
+p4 <- fn.histo_associate(df, df$pf_ratio_qualifying)
+name <- "Admit to MV"
+p5 <- fn.histo_associate(df, df$admit_to_mv)
+name <- "DP Weighted"
+p6 <- fn.histo_associate(df, df$driving_p_weighted)
+name <- "TV/PBW"
+p7 <- fn.histo_associate(df, df$tvpbw_weighted)
+name <- "Baseline Compliance"
+p8 <- fn.histo_associate(df, df$compliance_baseline)
+name <- "SOFA Score"
+p9 <- fn.histo_associate(df, df$nr_sofa_score)
+name <- "Study Month"
+p10 <- fn.histo_associate(df, df$study_month)
+plot1 <- grid.arrange(p1,p2,p3,p4,p5, p6, p7, p8, p9, p10,
+                      nrow = 3,
+                      top = "% LPV Adherence and Covariate Associations")
+
+ggsave("LPV_Covariate_Associations.pdf",
+       plot = plot1,
+       device = "pdf",
+       path=("graphs/"))
+
+rm(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10)
+
+#Explore Association Between Continuous Predictors and Death at Day 90
+fn.histo_associate <- function(df, var) {
+  ggplot(df, 
+       aes(x = var, y = died90)) +
+  geom_jitter(height = 0.1, width = 2, alpha = 0.25, size = 0.5) +
+  geom_smooth(method = "gam", method.args = list(family = "binomial")) +
+  scale_y_continuous(breaks=c(0,1), labels = c("0","1")) +
+  labs(x = name, y = "Death by Day 90", size = 0.1) +
+  theme(axis.title.x = element_text(size = 7),
+    axis.title.y = element_text(size = 7)
+  )
+}
+name <- "Age"
+p1 <- fn.histo_associate(df, df$age)
+name <- "BMI"
+p2 <- fn.histo_associate(df, df$bmi)
+name <- "Charlson Score"
+p3 <- fn.histo_associate(df, df$charlson)
+name <- "PF Qualifying"
+p4 <- fn.histo_associate(df, df$pf_ratio_qualifying)
+name <- "Admit to MV"
+p5 <- fn.histo_associate(df, df$admit_to_mv)
+name <- "DP Weighted"
+p6 <- fn.histo_associate(df, df$driving_p_weighted)
+name <- "TV/PBW"
+p7 <- fn.histo_associate(df, df$tvpbw_weighted)
+name <- "SOFA Score"
+p8 <- fn.histo_associate(df, df$nr_sofa_score)
+name <- "Study Month"
+p9 <- fn.histo_associate(df, df$study_month)
+name <- "LPV Percent"
+p10 <- fn.histo_associate(df, df$lpv_percent)
+plot1 <- grid.arrange(p1,p2,p3,p4,p5, p6, p7, p8, p9, p10,
+                      nrow = 3,
+                      top = "Death by Day 90 and Covariate Associations")
+
+ggsave("Died90_Covariate_Associations.pdf",
+       plot = plot1,
+       device = "pdf",
+       path=("graphs/"))
+
+rm(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10)
+```
+
+
+```{r Now Examine Using Cox Proportional Hazards Models and Competing Risk Models}
+#COVID-PERIOD Unit Needs to be Dummy Variable
+df <- df |>
+  mutate(period_unit=as.numeric(covid_period_unit))
+
+#DAY 90 Mortality
+#Univariable
+unvar <- coxph(Surv(diedtime90, died90) ~ imc_icu, data = df)
+print('Survival at 90 Days - Univariable')
+summary(unvar)
+
+#Univariable with Interaction
+#Univariable
+unvar_period <- coxph(Surv(diedtime90, died90) ~ factor(period_unit), data = df)
+print('Survival at 90 Days - Univariable')
+summary(unvar_period)
+
+unvar_interact <- coxph(Surv(diedtime90, died90) ~ imc_icu*covid_period, data = df)
+print('Survival at 90 Days - Univariable')
+summary(unvar_interact)
+
+#Multivariable
+multivar <- coxph(Surv(diedtime90, died90) ~ 
+                    imc_icu + age + gender + nonwhite + bmi + charlson + study_month + 
+                    steroids + immunomodulator + nr_sofa_score + pf_ratio_qualifying + 
+                    driving_p_weighted + lpv_percent + admit_to_mv + proned48,
+                    data = df)
+print('Survival at 90 Days - Multivariable')
+summary(multivar)
+
+#Multivariable with Dummy Variable for Period and Unit
+multivar_period <- coxph(Surv(diedtime90, died90) ~ 
+                    factor(period_unit) + age + gender + nonwhite + bmi + charlson +
+                    steroids + immunomodulator + nr_sofa_score + pf_ratio_qualifying + 
+                    driving_p_weighted + lpv_percent + admit_to_mv + proned48,
+                    data = df)
+print('Survival at 90 Days - Multivariable')
+summary(multivar_period)
+
+#Mutlivariable with Interaction Term of Unit Type and Period
+multivar_interact<- coxph(Surv(diedtime90, died90) ~ 
+                    imc_icu*covid_period + age + gender + nonwhite + 
+                      bmi + charlson +
+                    steroids + immunomodulator + nr_sofa_score + pf_ratio_qualifying + 
+                    driving_p_weighted + lpv_percent + admit_to_mv + proned48,
+                    data = df)
+print('Survival at 90 Days - Multivariable')
+summary(multivar_interact)
+
+#Off Ventilator by Day 28- Using Fine-Gray Regression
+#Univariable
+fg_df <- finegray(Surv(risk_time28, cmprsk_event28) ~ ., 
+                    data = df,
+                    etype = 'Off Vent')  # Corrected to use tempdf$weights
+  
+fg_fit <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                     imc_icu,
+                   data = fg_df,  # Corrected to use fg_df
+                   weight = fg_df$fgwt)
+summary(fg_fit)
+
+fg_fit_interact_un <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                     imc_icu*covid_period,
+                   data = fg_df,  # Corrected to use fg_df
+                   weight = fg_df$fgwt)
+summary(fg_fit_interact_un)
+
+
+#MultiVariable
+fg_fit <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                    imc_icu + age + gender + nonwhite + bmi + charlson + study_month + 
+                    steroids + immunomodulator + nr_sofa_score + pf_ratio_qualifying + 
+                    driving_p_weighted + lpv_percent + admit_to_mv + proned48,
+                   data = fg_df,  # Corrected to use fg_df
+                   weight = fg_df$fgwt)
+summary(fg_fit)
+
+fg_fit_muti_interact <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                    imc_icu*covid_period + age + gender + nonwhite + bmi + charlson + 
+                    steroids + immunomodulator + nr_sofa_score + pf_ratio_qualifying + 
+                    driving_p_weighted + lpv_percent + admit_to_mv + proned48,
+                   data = fg_df,  # Corrected to use fg_df
+                   weight = fg_df$fgwt)
+summary(fg_fit_muti_interact)
+
+```
+
+```{r Check Prortional Hazards}
+cox.zph(multivar)
+cox.zph(multivar_interact)
+cox.zph(fg_fit)
+```
+
+
